@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "com2tcp-utf8",
+      "name": "PowerShell UTF-8",
+      "command": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+      "args": ["-NoLogo", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "F:/tools/com2tcp/pebrel-shell.ps1"],
+      "cwd": "F:/tools/com2tcp",
+      "shell_id": "powershell"
+    },
+    {
+      "id": "com2tcp-com11-utf8",
+      "name": "COM11 - TCP 2011 (UTF-8)",
+      "command": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+      "args": ["-NoLogo", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "F:/tools/com2tcp/pebrel-shell.ps1", "-TcpPort", "2011"],
+      "cwd": "F:/tools/com2tcp",
+      "shell_id": "powershell"
+    },
+    {
+      "id": "com2tcp-com12-utf8",
+      "name": "COM12 - TCP 2012 (UTF-8)",
+      "command": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+      "args": ["-NoLogo", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "F:/tools/com2tcp/pebrel-shell.ps1", "-TcpPort", "2012"],
+      "cwd": "F:/tools/com2tcp",
+      "shell_id": "powershell"
+    }
+  ]
+}

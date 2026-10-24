@@ -1,0 +1,2 @@
+PASS GUI: legacy migration, add/remove, two-channel start/stop/restart, broadcast, conflicts, persistence and close cleanup
+PASS ALL: 1 behavioral scenarios; real TCP sockets, isolated serial transport and GUI.

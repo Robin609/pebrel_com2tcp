@@ -1,0 +1,11 @@
+PASS three modes preserve named profile, paths and isolated environment
+PASS offline ports refuse connection; local terminal remains available
+PASS missing Ncat affects serial modes only
+PASS missing exe, invalid profiles and missing profile are actionable
+PASS bridge and both folders dispatch exact targets
+PASS root lookup and Windows argument quoting
+PASS listener detection observes real TCP without connecting
+PASS icon has all seven sizes and executable has an associated icon
+PASS visible form wires every action, refresh, error and keyboard default
+PASS: 9 launcher scenarios
+

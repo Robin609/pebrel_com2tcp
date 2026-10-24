@@ -1,0 +1,99 @@
+{
+  "time": "2026-10-15T10:32:48.461373+08:00",
+  "binary": "F:\\tools\\com2tcp\\bin\\Com2Tcp.exe",
+  "binary_sha256": "8c703db8ed501c7b7081e8a42060a632a8c2f0c0546f97503090c0e927a80ee1",
+  "channels": [
+    {
+      "serial": "COM11",
+      "baud": 115200,
+      "tcp": 2011
+    },
+    {
+      "serial": "COM12",
+      "baud": 1500000,
+      "tcp": 2012
+    }
+  ],
+  "simultaneous_tcp_clients": 6,
+  "cases": [
+    {
+      "case": "COM11 ESP32 help / writer 1",
+      "writer": 1,
+      "clients": 3,
+      "bytes_per_client": 771,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM12 Linux printf / writer 1",
+      "writer": 1,
+      "clients": 3,
+      "bytes_per_client": 113,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM11 ESP32 help / writer 2",
+      "writer": 2,
+      "clients": 3,
+      "bytes_per_client": 771,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM12 Linux printf / writer 2",
+      "writer": 2,
+      "clients": 3,
+      "bytes_per_client": 113,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM11 ESP32 help / writer 3",
+      "writer": 3,
+      "clients": 3,
+      "bytes_per_client": 771,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM12 Linux printf / writer 3",
+      "writer": 3,
+      "clients": 3,
+      "bytes_per_client": 113,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM11 reconnect",
+      "writer": 1,
+      "clients": 1,
+      "bytes_per_client": 771,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "COM12 reconnect",
+      "writer": 1,
+      "clients": 1,
+      "bytes_per_client": 138,
+      "identical_broadcast": true,
+      "pass": true
+    },
+    {
+      "case": "MobaXterm built-in nc / ls",
+      "exit_code": 0,
+      "bytes_received": 46,
+      "pass": true,
+      "output_sample": "ls\r\n\u001b[?2004l\rfishros\r\n\u001b[?2004hcat@lubancat:~$ "
+    },
+    {
+      "case": "Windows nc launcher / device printf",
+      "exit_code": 0,
+      "bytes_received": 143,
+      "pass": true,
+      "output_sample": "printf '\\103\\062\\124\\103\\120\\137\\127\\111\\116\\104\\117\\127\\123\\137\\116\\103\\137\\117\\113\\n'\r\n\u001b[?2004l\rC2TCP_WINDOWS_NC_OK\r\n\u001b[?2004hcat@lubancat:~$ "
+    }
+  ],
+  "pass": true
+}

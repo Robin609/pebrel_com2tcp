@@ -1,0 +1,236 @@
+# Logo Assets
+
+## Nebula App Icon
+
+The rounded, asymmetric symbol and cutout prompt are shared by 25 colorways.
+Titanium (palette 21) is the default application and README identity. The
+display name is Pebrel; asset paths retain Nebula for compatibility. The original 01–24 palettes are available as
+personal choices, with graphite violet retained as palette 25.
+
+| Setting | Source | Role |
+| --- | --- | --- |
+| `titanium` | `nebula-titanium.svg` | Default identity; palette 21 |
+| `silver-violet` | `nebula-light.svg` | Optional silver-violet colorway; palette 12 |
+| `graphite-violet` | `nebula-dark.svg` | Optional graphite / gray-violet colorway; palette 25 |
+
+`nebula_settings/src/app_icon.rs` is the canonical catalog of stable setting
+keys, original palette numbers, bilingual names and colors. The renderer
+exports `icon-catalog.json` from it. Personal color options do not imply
+exclusive colors or completed trademark clearance.
+
+### Switching
+
+GPUI Settings → Appearance → App icon writes `app_icon=` to
+`nebula_settings.txt`. Missing or invalid values fall back to Titanium.
+Existing valid selections remain unchanged. The picker initially shows the
+three colorways above and the current selection, with a button to show all 25.
+Appearance reset restores the default; appearance backup includes the
+selection. Icon selection is independent of terminal/system theme selection.
+
+On Windows, selection updates open window icons (including Alt+Tab), the
+tray, and in-app previews. New windows and subsequent notifications use the
+selection too. Window icons use per-window DPI and are reapplied when the
+window's scale changes. Existing pinned shortcuts, Explorer's EXE icon and
+the installer keep the default brand icon; no shortcut, executable or system
+icon cache is rewritten. Linux/macOS currently change only the in-app preview;
+their Dock/launcher icon remains the packaged default.
+
+### Clarity and resource budget
+
+The default ICO contains 32-bit RGBA PNG frames at 16, 20, 24, 28, 32, 40, 48,
+56, 64, 80, 96, 112, 128 and 256 physical pixels. The shared coverage atlas
+contains these sizes plus a 512px frame. Below 64px, the mark gradually
+increases from 90 to 108 SVG units, with a pixel-fitted prompt and a minimum
+1.5px cutout stroke. The underline is aligned to the physical pixel grid.
+The tile and outer symbol paths stay unchanged; 64px and larger preserve
+the original master geometry.
+
+The generator renders at 8× resolution for 16–64px and 4× above that, then
+averages premultiplied coverage before applying colors. This avoids colored
+transparent fringes and sharpening halos. Nonstandard sizes resample coverage
+with a non-ringing triangle filter before colorization. In-app previews request
+their actual logical size times the window scale factor; the tray receives
+exact-size RGBA pixels without a second resize. Antialiasing still produces
+partially covered edge pixels, and shell/browser scaling can affect appearance.
+
+Windows embeds one default icon group and one shared coverage atlas, not 25
+complete ICOs or PNG collections. Palette colors are applied at runtime using
+the existing image dependency. Non-Windows in-app previews use the same atlas.
+The combined Windows image payload is 80,402 bytes (78.52 KiB), below the
+96 KiB budget enforced by the generator and tests. This measures image data,
+not installer growth. PNG/preview caches have a 128-entry limit; native window
+icon handles are reused, and owned tray handles are destroyed when replaced.
+
+`nebula.ico` is byte-identical to `nebula-titanium.ico`, and `nebula.png` to
+`nebula-titanium.png`. Alternate ICOs and 1024px PNG exports are design assets,
+not extra GPUI runtime embeds.
+
+Regenerate using Node.js 24+ with `@resvg/resvg-js` (verified with 2.6.2):
+
+```sh
+node scripts/render-app-icons.mjs /path/to/renderer/package.json
+node scripts/render-app-icons.mjs /path/to/renderer/package.json --check
+python3 -m unittest scripts.tests.test_app_icons -v
+cargo test -p nebula-settings --offline --locked
+cargo test -p nebula --bin nebula --features gpui-shell app_icon::tests
+```
+
+The renderer is development-only; it adds no application dependency. The
+optional argument locates a separate renderer installation. The default
+`nebula.ico` and `nebula.png` exports always remain Titanium.
+
+### Design archive
+
+The local 24-color exploration remains in
+`docs/design/icon-color-lab-2026-09-05/index.html`. The updated local preview at
+`docs/design/icon-all-palettes-2026-09-05/index.html` shows all 25 choices on
+light/dark surfaces and a before/after small-size comparison. These are PNG
+contact sheets, not native taskbar screenshots. Original sage SVG masters
+remain in `docs/design/icon-final-2026-09-05/archive/`. The historical pages
+do not define the current default. These local design archives are ignored
+by Git and are not required by the asset tests.
+
+## Third-Party Logo Assets
+
+### Agents settings vectors
+
+The Agents settings page renders 24 logical pixel SVG marks rather than enlarging
+the sidebar PNG textures. Claude, Kimi and Oh My Pi reuse the SVG sources below;
+Cursor and Copilot reuse the existing settings icons. OpenAI, OpenCode, Pi and
+Grok use `nebula_app/assets/icons/nebula-agent-{openai,opencode,pi,grok}.svg`,
+retrieved from the fixed npm package `@lobehub/icons-static-svg` 1.95.0:
+`https://unpkg.com/@lobehub/icons-static-svg@1.95.0/icons/{name}.svg`.
+These four sources are unchanged except for a final newline, under the collection's
+[MIT license](LICENSE-lobe-icons). Product trademarks belong to their owners.
+GPUI renders the SVG alpha masks using theme ink, with orange for Claude and
+purple for Oh My Pi; sidebar PNG presentation is independent.
+
+### Cursor and GitHub Copilot settings icons
+
+`nebula_app/assets/icons/nebula-agent-cursor.svg` and
+`nebula_app/assets/icons/nebula-agent-copilot.svg` use the monochrome marks from
+`@lobehub/icons-static-svg` 1.95.0, retrieved on 2026-09-20:
+
+- Cursor: https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@1.95.0/icons/cursor.svg
+- GitHub Copilot: https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@1.95.0/icons/githubcopilot.svg
+- License: [MIT](LICENSE-lobe-icons), copyright LobeHub.
+
+Only the unused title, CSS sizing attributes and explicit closing path tags were
+removed. The viewBox and path geometry are unchanged. The two embedded SVGs total
+2,393 bytes; the other settings icons reuse the sidebar's existing small textures.
+These marks identify the installed tools and do not imply endorsement.
+
+### Claude Code and Trae CLI
+
+`ai_claude.svg` and `ai_trae.svg` are vector masters from LobeHub's icon
+collection, retrieved on 2026-09-13 at these exact revisions:
+
+- Claude: https://github.com/lobehub/lobe-icons/blob/f25f22c0e7295a76077fe417d23deeb56eefdf3e/packages/static-svg/icons/claude-color.svg
+- Trae: https://github.com/lobehub/lobe-icons/blob/0935313ef153c255958754d9d2523862e069c2c9/packages/static-svg/icons/trae-color.svg
+- Collection license: [MIT](LICENSE-lobe-icons), copyright LobeHub. Product names
+  and trademarks remain with their respective owners; use identifies running
+  programs and does not imply endorsement.
+
+The matching PNGs are 1024 x 1024 transparent exports made with
+`@resvg/resvg-js` 2.6.2 and `fitTo: { mode: 'width', value: 1024 }`, without
+changing geometry or colors. The renderer is a development tool, not a product
+dependency. Both shells prepare antialiased textures at the requested physical
+size and keep the source colors on light and dark themes.
+
+- Claude PNG SHA-256: `00EF583DAA55F37717C79269A2641C81B0E77F303BEA9E7EEF08482C84D76269`
+- Trae PNG SHA-256: `C502272694D1ABDD70DBD783F51171A497C136391BE035F2D67146BD9EC0CF23`
+
+Trae's `trae-cli` executable name is declared by ByteDance's
+[`trae-agent` project](https://github.com/bytedance/trae-agent/blob/main/pyproject.toml)
+under `[project.scripts]`. Detection and branding do not imply Hook, cold-start,
+resume, or fork support.
+
+### CodeBuddy Code
+
+`ai_codebuddy.svg` contains the CodeBuddy color mark from LobeHub's icon
+collection, with only a final newline added. It was retrieved on 2026-09-14
+at the following exact revision:
+
+- Source: https://github.com/lobehub/lobe-icons/blob/3928068a986819bedd4feca1a01a9ba9c3229f3b/packages/static-svg/icons/codebuddy-color.svg
+- Collection license: [MIT](LICENSE-lobe-icons), copyright LobeHub. Product names
+  and trademarks remain with their respective owners; use identifies running
+  programs and does not imply endorsement.
+- PNG SHA-256: `56ACBB748F6B324CD3D052EFD1E76A33811B36872489DF20DCB562A3C6087DE4`
+
+`ai_codebuddy.png` is a 1024 x 1024 export made with `@resvg/resvg-js` 2.6.2
+and the same rendering settings as Claude and Trae above. Both shells preserve
+its colors on light and dark themes.
+
+The `codebuddy`, `cbc`, `codebuddy-code`, and `codebuddy-lowmem` aliases are
+published in [`@tencent-ai/codebuddy-code` 2.150.0](https://registry.npmjs.org/@tencent-ai/codebuddy-code/2.150.0).
+The `cbc-prewarm` helper is excluded. Recognition does not add session resume,
+fork commands, or AI hooks.
+
+### Kimi Code
+
+`ai_kimi.svg` contains the Kimi color mark from LobeHub's icon collection,
+with only a final newline added. It was retrieved on 2026-09-17 from the
+published npm package `@lobehub/icons-static-svg` 1.95.0 (`icons/kimi-color.svg`),
+the packaged form of the lobe-icons repository's `packages/static-svg` directory
+(the same artwork ships as the `Kimi.Color` component in `@lobehub/icons` 5.18.0):
+
+- Repository source: https://github.com/lobehub/lobe-icons/blob/main/packages/static-svg/icons/kimi-color.svg
+- Collection license: [MIT](LICENSE-lobe-icons), copyright LobeHub. Product names
+  and trademarks remain with their respective owners; use identifies running
+  programs and does not imply endorsement.
+- PNG SHA-256: `FC3F905ADC68DFE9E14AD23B123F55AB71D32BF0D855A2CF6580F6B5CFF0BE99`
+
+`ai_kimi.png` is a 1024 x 1024 transparent export made with `@resvg/resvg-js`
+2.6.2 and the same rendering settings as Claude and Trae above. The mark is a
+white letterform with a blue accent; embedded unchanged it would vanish on light
+surfaces, so both shells treat it as a luminance map at render time (like
+OpenCode): the letterform takes the theme ink at full strength and the accent
+dims proportionally. The committed bytes keep the source colors. The icon
+identifies running `kimi` and `kimi-code` processes and does not imply
+endorsement by Moonshot AI.
+
+### Oh My Pi
+
+`ai_omp.svg` is a Pebrel-drawn purple gradient π mark following the maintainer's
+2026-09-13 visual reference. Its simple vector geometry is authored here; no
+third-party application asset is embedded. This is a presentation variant, not the
+upstream white π / orange connector artwork currently published in
+[oh-my-pi/assets/icon.svg](https://github.com/can1357/oh-my-pi/blob/2be354322dee0cdd95bc42fc61c72ef9767b653b/assets/icon.svg).
+`ai_omp.png` is a transparent 1024 x 1024 export made with the same resvg settings
+as Claude and Trae above. It identifies the existing `omp` / `oh-my-pi` agent
+identity and preserves its gradient in both themes.
+
+### Grok
+
+`ai_grok_dark.png` and `ai_grok_light.png` are unmodified copies of
+`Grok_Logomark_Dark.png` and `Grok_Logomark_Light.png` from the official xAI
+asset archive:
+
+- Brand guidelines: https://x.ai/legal/brand-guidelines
+- Asset archive: https://data.x.ai/logos/xAI_Grok_Assets.zip
+- Archive SHA-256: `F41A93923A85047B4B5A9571B7EC73339F562C3E58ACD096E25584AB0AE2A1FB`
+- Dark PNG SHA-256: `37DDBCB6E2A7F2E4B3BE78A7D41296A3BC7EDF6926362434EFC00DF5A56A3586`
+- Light PNG SHA-256: `359056EE8983CFA0BA7E72795078C7C0DDF6C5D7A1870401AB960ED4F9DF9E53`
+
+xAI owns the trademark, intellectual property, and branding rights in xAI,
+Grok, and their logos. The xAI Brand Guidelines are usage terms, not an
+open-source asset license. These files are used only to identify a running
+`grok` or `grok-cli` process and do not imply xAI endorsement, approval, or
+sponsorship. The application selects the supplied dark or light file for
+contrast and scales it only when rendering; the committed files are unchanged.
+
+### Google Antigravity
+
+`ai_antigravity.png` is an unmodified copy of the full-color product icon from
+Google's Antigravity press assets, verified on 2026-09-06:
+
+- Press assets: https://antigravity.google/press/
+- PNG: https://antigravity.google/assets/image/brand/antigravity-icon__full-color.png
+- Dimensions: 540 x 540, with transparency
+- SHA-256: `E0CD08CCD10CD8D08CCF0BA449823EE88495825C0841619618100D3AB089F51E`
+
+Google retains rights to its product names and logos. Publication in a press kit
+does not make the logo an open-source asset or imply endorsement. The icon is
+used to identify running `antigravity`, `antigravity-cli` and `agy` processes.
+Both UI shells keep its original colors on light and dark themes and resize it
+only for rendering. No LobeHub asset is embedded for Antigravity.

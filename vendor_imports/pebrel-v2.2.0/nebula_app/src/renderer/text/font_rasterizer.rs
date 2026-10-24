@@ -1,0 +1,491 @@
+#[cfg(windows)]
+use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
+use std::sync::Arc;
+
+#[cfg(windows)]
+use crossfont::{
+    BitmapBuffer, Error, FontDesc, FontKey, GlyphKey, Metrics, Rasterize, RasterizedGlyph, Size,
+    Slant, Style, Weight,
+};
+#[cfg(windows)]
+use dwrote::{
+    CustomFontCollectionLoaderImpl, DWRITE_GLYPH_RUN, FontCollection, FontFace, FontFile,
+    FontStretch, FontStyle, FontWeight, GlyphOffset, GlyphRunAnalysis,
+};
+
+#[cfg(windows)]
+pub(super) static EMBEDDED_FONT_BYTES: &[u8] = crate::font_install::REQUIRED_FONT_BYTES;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FontSource {
+    System,
+    Embedded,
+}
+
+#[cfg(windows)]
+pub(super) fn preferred_font_source(
+    system_available: bool,
+    embedded_available: bool,
+) -> Option<FontSource> {
+    if system_available {
+        Some(FontSource::System)
+    } else if embedded_available {
+        Some(FontSource::Embedded)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+pub(super) struct StaticFontData(&'static [u8]);
+
+#[cfg(windows)]
+impl StaticFontData {
+    pub(super) fn new() -> Self {
+        Self(EMBEDDED_FONT_BYTES)
+    }
+}
+
+#[cfg(windows)]
+impl AsRef<[u8]> for StaticFontData {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct Rasterizer {
+    system: crossfont::Rasterizer,
+    private_collection: FontCollection,
+    private_files: Vec<FontFile>,
+    private_paths: HashSet<std::path::PathBuf>,
+    embedded_fonts: HashMap<FontKey, EmbeddedFont>,
+    embedded_keys: HashMap<FontDesc, FontKey>,
+    /// Missing glyphs are resolved only after the primary face rejects them.
+    /// Ordered fallback chain per primary face — the user's extra families
+    /// first (issue #33), the embedded Maple always last. The glyph cache
+    /// stores the result, so this map is not touched per frame.
+    fallback_chains: HashMap<FontKey, Vec<FontKey>>,
+}
+
+#[cfg(windows)]
+struct EmbeddedFont {
+    face: FontFace,
+}
+
+#[cfg(windows)]
+impl Rasterizer {
+    pub(crate) fn load_preferred_font(
+        &mut self,
+        description: &FontDesc,
+        family: &str,
+        slant: Slant,
+        weight: Weight,
+        size: Size,
+    ) -> Result<FontKey, Error> {
+        let system = self.system.load_font(description, size);
+        let primary = if preferred_font_source(system.is_ok(), true) == Some(FontSource::System) {
+            system?
+        } else {
+            let embedded = self.load_embedded_font(family, slant, weight, size);
+            match preferred_font_source(false, embedded.is_ok()) {
+                Some(FontSource::Embedded) => embedded?,
+                _ => return system,
+            }
+        };
+
+        // 自定义字体只负责它实际包含的字形；中文和 Nerd Font 私用区由随程序
+        // 内置的 Maple 托底，避免为了换字体而牺牲终端内容或原生界面图标。
+        // 用户配置的多级 fallback（若有）由 glyph cache 随后整链覆盖。
+        if let Ok(fallback) =
+            self.load_embedded_font(crate::font_install::REQUIRED_FONT_FAMILY, slant, weight, size)
+        {
+            if fallback != primary {
+                self.fallback_chains.insert(primary, vec![fallback]);
+            }
+        }
+
+        Ok(primary)
+    }
+
+    /// Replace `primary`'s ordered fallback chain. Faces are tried in order
+    /// after the primary reports a missing glyph; the caller terminates the
+    /// chain with the embedded Maple so CJK and icon coverage never regresses.
+    pub(super) fn set_fallback_chain(&mut self, primary: FontKey, chain: Vec<FontKey>) {
+        if chain.is_empty() {
+            self.fallback_chains.remove(&primary);
+        } else {
+            self.fallback_chains.insert(primary, chain);
+        }
+    }
+
+    /// 用族名换 `FontKey` 的唯一入口：先查系统集合，再查私有集合（导入
+    /// 字体与内置 Maple 都活在那里）。所有按族名找字体的路径——预览、
+    /// 可用性校验、fallback 链——统一走这里，不再各自拼两条查找路径。
+    pub(crate) fn load_family_font(
+        &mut self,
+        family: &str,
+        slant: Slant,
+        weight: Weight,
+        size: Size,
+    ) -> Result<FontKey, Error> {
+        let description = FontDesc::new(family, Style::Description { slant, weight });
+        match self.system.load_font(&description, size) {
+            Ok(key) => Ok(key),
+            Err(_) => self.load_embedded_font(family, slant, weight, size),
+        }
+    }
+
+    pub(super) fn load_embedded_font(
+        &mut self,
+        family: &str,
+        slant: Slant,
+        weight: Weight,
+        _size: Size,
+    ) -> Result<FontKey, Error> {
+        let description = FontDesc::new(family, Style::Description { slant, weight });
+        if let Some(key) = self.embedded_keys.get(&description) {
+            return Ok(*key);
+        }
+
+        let family = self
+            .private_collection
+            .font_family_by_name(family)
+            .map_err(directwrite_error)?
+            .ok_or_else(|| Error::FontNotFound(description.clone()))?;
+        let font = family
+            .first_matching_font(font_weight(weight), FontStretch::Normal, font_style(slant))
+            .map_err(directwrite_error)?;
+        let key = FontKey::next();
+        self.embedded_fonts.insert(key, EmbeddedFont { face: font.create_font_face() });
+        self.embedded_keys.insert(description, key);
+        Ok(key)
+    }
+
+    /// 枚举系统已安装字体族，并带上 DirectWrite 的权威等宽判定。
+    ///
+    /// 只在**字体目录**首次展开时调用：`FontCollection::system()` 加上逐族
+    /// 取首字体问 `IsMonospacedFont` 在装了几百个字体的机器上是实打实的
+    /// 开销，放在启动路径上会拖慢每一次冷启。实现在共享层
+    /// `font_install::enumerate_system_font_families`（GPUI 字体选择器同源）。
+    pub(crate) fn system_font_families(&self) -> Vec<crate::font_install::SystemFontFamily> {
+        crate::font_install::enumerate_system_font_families()
+    }
+
+    pub(crate) fn private_font_families(&self) -> Vec<String> {
+        let mut families = self
+            .private_collection
+            .families_iter()
+            .filter_map(|family| family.family_name().ok())
+            .collect::<Vec<_>>();
+        families.sort_by_key(|family| family.to_ascii_lowercase());
+        families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        families
+    }
+
+    pub(crate) fn add_private_font(&mut self, path: &Path) -> Result<Vec<String>, Error> {
+        let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let file = FontFile::new_from_path(path).ok_or_else(|| {
+            Error::PlatformError(format!("DirectWrite rejected {}", path.display()))
+        })?;
+        let probe = private_collection(&[file.clone()]);
+        let families = probe
+            .families_iter()
+            .filter_map(|family| family.family_name().ok())
+            .collect::<Vec<_>>();
+        if families.is_empty() {
+            return Err(Error::PlatformError("font file contains no usable family".to_owned()));
+        }
+        if self.private_paths.contains(&normalized) {
+            return Ok(families);
+        }
+
+        self.private_files.push(file);
+        self.private_paths.insert(normalized);
+        self.private_collection = private_collection(&self.private_files);
+        self.embedded_keys.clear();
+        Ok(families)
+    }
+
+    pub(crate) fn refresh_private_fonts(&mut self) -> Vec<String> {
+        for path in crate::font_install::imported_font_files() {
+            if let Err(error) = self.add_private_font(&path) {
+                log::warn!("failed to refresh imported font {}: {error}", path.display());
+            }
+        }
+        self.private_font_families()
+    }
+
+    fn rasterize_once(&mut self, glyph: GlyphKey) -> Result<RasterizedGlyph, Error> {
+        let Some(font) = self.embedded_fonts.get(&glyph.font_key) else {
+            return self.system.get_glyph(glyph);
+        };
+        let glyph_index = font
+            .face
+            .glyph_indices(&[glyph.character as u32])
+            .map_err(directwrite_error)?
+            .first()
+            .copied()
+            .unwrap_or(0);
+        let rasterized = Self::rasterize_embedded(font, glyph.size, glyph.character, glyph_index)?;
+        if glyph_index == 0 { Err(Error::MissingGlyph(rasterized)) } else { Ok(rasterized) }
+    }
+
+    pub(super) fn is_embedded_font(&self, key: FontKey) -> bool {
+        self.embedded_fonts.contains_key(&key)
+    }
+
+    fn embedded_metrics(font: &EmbeddedFont, size: Size) -> Result<Metrics, Error> {
+        let vertical = font.face.metrics().metrics0();
+        let scale = size.as_px() / f32::from(vertical.designUnitsPerEm);
+        let glyph_index = font
+            .face
+            .glyph_indices(&['!' as u32])
+            .map_err(directwrite_error)?
+            .first()
+            .copied()
+            .unwrap_or(0);
+        let horizontal = font
+            .face
+            .design_glyph_metrics(&[glyph_index], false)
+            .map_err(directwrite_error)?
+            .into_iter()
+            .next()
+            .ok_or(Error::MetricsNotFound)?;
+
+        let ascent = f32::from(vertical.ascent) * scale;
+        let descent = -f32::from(vertical.descent) * scale;
+        let line_gap = f32::from(vertical.lineGap) * scale;
+        Ok(Metrics {
+            average_advance: f64::from(horizontal.advanceWidth) * f64::from(scale),
+            line_height: f64::from(ascent - descent + line_gap),
+            descent,
+            underline_position: f32::from(vertical.underlinePosition) * scale,
+            underline_thickness: f32::from(vertical.underlineThickness) * scale,
+            strikeout_position: f32::from(vertical.strikethroughPosition) * scale,
+            strikeout_thickness: f32::from(vertical.strikethroughThickness) * scale,
+        })
+    }
+
+    fn rasterize_embedded(
+        font: &EmbeddedFont,
+        size: Size,
+        character: char,
+        glyph_index: u16,
+    ) -> Result<RasterizedGlyph, Error> {
+        let glyph_run = DWRITE_GLYPH_RUN {
+            fontFace: unsafe { font.face.as_ptr() },
+            fontEmSize: size.as_px(),
+            glyphCount: 1,
+            glyphIndices: &glyph_index,
+            glyphAdvances: &0.0,
+            glyphOffsets: &GlyphOffset::default(),
+            isSideways: 0,
+            bidiLevel: 0,
+        };
+        let rendering_mode = font.face.get_recommended_rendering_mode_default_params(
+            size.as_px(),
+            1.0,
+            dwrote::DWRITE_MEASURING_MODE_NATURAL,
+        );
+        let analysis = GlyphRunAnalysis::create(
+            &glyph_run,
+            1.0,
+            None,
+            rendering_mode,
+            dwrote::DWRITE_MEASURING_MODE_NATURAL,
+            0.0,
+            0.0,
+        )
+        .map_err(directwrite_error)?;
+        let bounds = analysis
+            .get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1)
+            .map_err(directwrite_error)?;
+        let buffer = analysis
+            .create_alpha_texture(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1, bounds)
+            .map_err(directwrite_error)?;
+        Ok(RasterizedGlyph {
+            character,
+            width: bounds.right - bounds.left,
+            height: bounds.bottom - bounds.top,
+            top: -bounds.top,
+            left: bounds.left,
+            advance: (0, 0),
+            buffer: BitmapBuffer::Rgb(buffer),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) type Rasterizer = crossfont::Rasterizer;
+
+#[cfg(windows)]
+impl Rasterize for Rasterizer {
+    fn new() -> Result<Self, Error> {
+        let system = crossfont::Rasterizer::new()?;
+        let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(StaticFontData::new());
+        let file = FontFile::new_from_buffer(data).ok_or_else(|| {
+            Error::PlatformError("DirectWrite rejected the embedded Maple Mono font".to_owned())
+        })?;
+        let mut private_files = vec![file];
+        let mut private_paths = HashSet::new();
+        for path in crate::font_install::imported_font_files() {
+            match FontFile::new_from_path(&path) {
+                Some(file) => {
+                    private_paths.insert(path.canonicalize().unwrap_or(path));
+                    private_files.push(file);
+                },
+                None => log::warn!("DirectWrite ignored imported font {}", path.display()),
+            }
+        }
+        let private_collection = private_collection(&private_files);
+        Ok(Self {
+            system,
+            private_collection,
+            private_files,
+            private_paths,
+            embedded_fonts: HashMap::new(),
+            embedded_keys: HashMap::new(),
+            fallback_chains: HashMap::new(),
+        })
+    }
+
+    fn metrics(&self, key: FontKey, size: Size) -> Result<Metrics, Error> {
+        match self.embedded_fonts.get(&key) {
+            Some(font) => Self::embedded_metrics(font, size),
+            None => self.system.metrics(key, size),
+        }
+    }
+
+    fn load_font(&mut self, description: &FontDesc, size: Size) -> Result<FontKey, Error> {
+        self.system.load_font(description, size)
+    }
+
+    fn get_glyph(&mut self, glyph: GlyphKey) -> Result<RasterizedGlyph, Error> {
+        let rasterized = self.rasterize_once(glyph);
+        if !matches!(rasterized, Err(Error::MissingGlyph(_))) {
+            return rasterized;
+        }
+        // 依序走 fallback 链，第一张有此字形的脸胜出;整链都缺就带着主字体
+        // 的 MissingGlyph 占位返回,让缓存层照旧处理缺字形。
+        let chain = self.fallback_chains.get(&glyph.font_key).cloned().unwrap_or_default();
+        for font_key in chain {
+            match self.rasterize_once(GlyphKey { font_key, ..glyph }) {
+                Err(Error::MissingGlyph(_)) => continue,
+                resolved => return resolved,
+            }
+        }
+        rasterized
+    }
+
+    fn kerning(&mut self, left: GlyphKey, right: GlyphKey) -> (f32, f32) {
+        if self.is_embedded_font(left.font_key) || self.is_embedded_font(right.font_key) {
+            (0.0, 0.0)
+        } else {
+            self.system.kerning(left, right)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn private_collection(files: &[FontFile]) -> FontCollection {
+    let loader = CustomFontCollectionLoaderImpl::new(files);
+    FontCollection::from_loader(loader)
+}
+
+#[cfg(windows)]
+fn directwrite_error(error: i32) -> Error {
+    Error::PlatformError(format!("DirectWrite error: {error:#X}"))
+}
+
+#[cfg(windows)]
+fn font_weight(weight: Weight) -> FontWeight {
+    match weight {
+        Weight::Normal => FontWeight::Regular,
+        Weight::Bold => FontWeight::Bold,
+    }
+}
+
+#[cfg(windows)]
+fn font_style(slant: Slant) -> FontStyle {
+    match slant {
+        Slant::Normal => FontStyle::Normal,
+        Slant::Italic => FontStyle::Italic,
+        Slant::Oblique => FontStyle::Oblique,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::mem;
+
+    use crossfont::{FontDesc, GlyphKey, Rasterize, Size, Slant, Style, Weight};
+
+    use super::{
+        EMBEDDED_FONT_BYTES, FontSource, Rasterizer, StaticFontData, preferred_font_source,
+    };
+
+    #[test]
+    fn system_font_is_preferred_before_the_embedded_fallback() {
+        assert_eq!(preferred_font_source(true, true), Some(FontSource::System));
+        assert_eq!(preferred_font_source(false, true), Some(FontSource::Embedded));
+        assert_eq!(preferred_font_source(false, false), None);
+    }
+
+    #[test]
+    fn custom_system_font_missing_glyphs_fall_back_to_embedded_maple() {
+        let mut rasterizer = Rasterizer::new().expect("DirectWrite rasterizer");
+        let size = Size::new(11.25);
+        let description = FontDesc::new(
+            "Consolas",
+            Style::Description { slant: Slant::Normal, weight: Weight::Normal },
+        );
+        let key = rasterizer
+            .load_preferred_font(&description, "Consolas", Slant::Normal, Weight::Normal, size)
+            .expect("Consolas");
+
+        assert!(!rasterizer.is_embedded_font(key));
+        for character in ['\u{4e2d}', '\u{ea83}'] {
+            let glyph = rasterizer
+                .get_glyph(GlyphKey { character, font_key: key, size })
+                .unwrap_or_else(|error| panic!("fallback glyph {character:?}: {error}"));
+            assert!(glyph.width > 0);
+            assert!(glyph.height > 0);
+        }
+    }
+
+    #[test]
+    fn embedded_font_storage_borrows_the_static_pe_bytes() {
+        let storage = StaticFontData::new();
+        assert_eq!(mem::size_of_val(&storage), mem::size_of::<&'static [u8]>());
+        assert_eq!(storage.as_ref().as_ptr(), EMBEDDED_FONT_BYTES.as_ptr());
+        assert_eq!(storage.as_ref().len(), EMBEDDED_FONT_BYTES.len());
+    }
+
+    #[test]
+    fn embedded_directwrite_collection_rasterizes_maple_glyphs() {
+        let mut rasterizer = Rasterizer::new().expect("DirectWrite rasterizer");
+        let size = Size::new(11.25);
+        let key = rasterizer
+            .load_embedded_font(
+                crate::font_install::REQUIRED_FONT_FAMILY,
+                Slant::Normal,
+                Weight::Normal,
+                size,
+            )
+            .expect("embedded Maple Mono");
+
+        assert!(rasterizer.is_embedded_font(key));
+        for character in ['A', '\u{ea83}', '\u{4e2d}'] {
+            let glyph = rasterizer
+                .get_glyph(GlyphKey { character, font_key: key, size })
+                .unwrap_or_else(|error| panic!("embedded glyph {character:?}: {error}"));
+            assert!(glyph.width > 0);
+            assert!(glyph.height > 0);
+        }
+    }
+}

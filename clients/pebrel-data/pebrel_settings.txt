@@ -1,0 +1,10 @@
+language=zh-CN
+ai_hooks=0
+ghost=0
+shell=pwsh
+quick_terminal_width=1552
+quick_terminal_height=1088
+copy_on_select=1
+multiline_paste_confirm=0
+auto_check_updates=0
+scrollback_lines=10000

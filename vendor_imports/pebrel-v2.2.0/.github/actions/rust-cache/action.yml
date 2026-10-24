@@ -1,0 +1,208 @@
+name: Cargo downloads and compiled targets
+description: Share downloads across jobs without duplicating them in every target cache
+
+inputs:
+  key:
+    description: Compiled workload (core, product, release or legacy)
+    required: true
+  target:
+    description: Compiled profile directories to retain, relative to the repository
+    required: true
+  legacy-key:
+    description: Previous combined cache key, restored only during migration
+    default: ""
+  extra-key:
+    description: Additional inputs for native build tools stored with this target
+    default: ""
+  revision:
+    description: Snapshot suffix; empty uses the source SHA, dependency snapshots use a fixed generation
+    default: ""
+  save-if:
+    description: Allow publishing caches; PR consumers can restore without competing with the default branch
+    default: "true"
+  restore-downloads:
+    description: Restore and populate shared downloads; disable only when an earlier call in this job already restored them
+    default: "true"
+
+outputs:
+  cache-key:
+    description: Key to use when saving compiled targets
+    value: ${{ steps.identity.outputs.key }}
+  cache-hit:
+    description: Whether the compiled target cache matched exactly
+    value: ${{ steps.target.outputs.cache-hit }}
+  cache-matched-key:
+    description: The compiled target cache key actually restored by actions/cache
+    value: ${{ steps.target.outputs.cache-matched-key }}
+  save-enabled:
+    description: Whether the caller permits publishing cache snapshots
+    value: ${{ inputs.save-if }}
+  legacy-fallback-invoked:
+    description: Whether the optional legacy cache fallback action was invoked
+    value: ${{ steps.cache-summary.outputs.legacy-fallback-invoked }}
+  legacy-fallback-outcome:
+    description: Outcome of the optional legacy cache fallback action
+    value: ${{ steps.cache-summary.outputs.legacy-fallback-outcome }}
+
+runs:
+  using: composite
+  steps:
+    - name: Identify compiler and build environment
+      id: identity
+      shell: bash
+      env:
+        CACHE_OS: ${{ runner.os }}
+        CACHE_ARCH: ${{ runner.arch }}
+        CACHE_WORKLOAD: ${{ inputs.key }}
+        CACHE_REVISION: ${{ inputs.revision || github.sha }}
+        CACHE_MANIFESTS: ${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '**/.cargo/config.toml', '.github/ci-profile.toml') }}${{ inputs.extra-key }}
+      run: |
+        python - <<'PY'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+        import subprocess
+        facts = {"rustc": subprocess.check_output(["rustc", "-vV"], text=True)}
+        prefixes = ("CARGO_PROFILE_", "CFLAGS", "CXXFLAGS", "RUSTFLAGS")
+        names = {"CARGO_BUILD_TARGET", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
+                 "CC", "CXX", "ImageOS", "MACOSX_DEPLOYMENT_TARGET", "SDKROOT", "DEVELOPER_DIR"}
+        normalize = str.upper if os.name == "nt" else str
+        names = {normalize(name) for name in names}
+        facts["environment"] = {normalize(key): value for key, value in os.environ.items()
+                                if normalize(key) in names or normalize(key).startswith(prefixes)}
+        if os.environ["CACHE_OS"] == "macOS":
+            facts["sdk"] = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True)
+        fingerprint = hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()[:16]
+        prefix = "cargo-targets-v1-" + "-".join(os.environ[name] for name in
+                                              ("CACHE_OS", "CACHE_ARCH", "CACHE_WORKLOAD"))
+        prefix += "-" + fingerprint + "-"
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            # 发布任务按源码刷新；原生 CI 可固定代次，只在依赖或工具链变化后新建快照。
+            # 缓存命中只复用编译输入，调用方仍须执行当前提交的全部检查。
+            output.write("key=" + prefix + os.environ["CACHE_MANIFESTS"] + "-" + os.environ["CACHE_REVISION"] + "\n")
+            output.write("manifest-key=" + prefix + os.environ["CACHE_MANIFESTS"] + "\n")
+            output.write("restore-key=" + prefix + "\n")
+            # Recover the preceding Windows cache, which omitted ImageOS because
+            # Python uppercases environment names there. Cargo revalidates it.
+            if os.name == "nt":
+                facts["environment"].pop("IMAGEOS", None)
+                previous = hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()[:16]
+                output.write("migration-key=" + prefix.replace(fingerprint, previous) + "\n")
+            output.write("cargo-home=" + (os.environ.get("CARGO_HOME") or str(Path.home() / ".cargo")) + "\n")
+        PY
+    - name: Restore shared Cargo downloads
+      id: downloads
+      if: inputs.restore-downloads == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        # Preserve Git source checkouts with their mtimes. Recreating them from
+        # git/db can make timestamp-based dependency fingerprints dirty even
+        # after compiled targets were restored. Registry crates remain immutable
+        # archives: Cargo can recreate their extracted sources without this risk.
+        path: |
+          ${{ steps.identity.outputs.cargo-home }}/registry/index
+          ${{ steps.identity.outputs.cargo-home }}/registry/cache
+          ${{ steps.identity.outputs.cargo-home }}/git/db
+          ${{ steps.identity.outputs.cargo-home }}/git/checkouts
+        # 同一 OS 的两种架构共享源码，编译产物仍按架构隔离。
+        key: cargo-downloads-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: |
+          cargo-downloads-v3-${{ runner.os }}-
+          cargo-downloads-v2-${{ runner.os }}-${{ runner.arch }}-
+    - name: Restore compiled targets
+      id: target
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.target }}
+        key: ${{ steps.identity.outputs.key }}
+        restore-keys: |
+          ${{ steps.identity.outputs.manifest-key }}
+          ${{ steps.identity.outputs.restore-key }}
+          ${{ steps.identity.outputs.migration-key }}
+    - name: Recover an existing combined cache during migration
+      id: legacy-fallback
+      if: steps.target.outputs.cache-matched-key == '' && inputs.legacy-key != ''
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.legacy-key }}
+        workspaces: . -> target
+        cache-bin: false
+        cache-on-failure: true
+        save-if: false
+    - name: Summarize compiled target cache
+      id: cache-summary
+      if: always()
+      shell: bash
+      env:
+        TARGET_CACHE_HIT: ${{ steps.target.outputs.cache-hit }}
+        TARGET_CACHE_MATCHED_KEY: ${{ steps.target.outputs.cache-matched-key }}
+        SAVE_KEY: ${{ steps.identity.outputs.key }}
+        LEGACY_CONFIGURED: ${{ inputs.legacy-key != '' && 'true' || 'false' }}
+        LEGACY_OUTCOME: ${{ steps.legacy-fallback.outcome }}
+        CACHE_WORKLOAD: ${{ inputs.key }}
+        RUNNER_OS_VALUE: ${{ runner.os }}
+        RUNNER_ARCH_VALUE: ${{ runner.arch }}
+        CACHE_SAVE_ENABLED: ${{ inputs.save-if }}
+      run: |
+        set -euo pipefail
+
+        target_cache_hit="${TARGET_CACHE_HIT:-false}"
+        target_cache_matched_key="${TARGET_CACHE_MATCHED_KEY:-<none>}"
+        save_key="${SAVE_KEY:-<none>}"
+        legacy_configured="${LEGACY_CONFIGURED:-false}"
+        legacy_outcome="${LEGACY_OUTCOME:-skipped}"
+        legacy_invoked=false
+        if [[ "$legacy_configured" == 'true' && "$legacy_outcome" != 'skipped' && -n "$legacy_outcome" ]]; then
+          legacy_invoked=true
+        fi
+
+        {
+          echo '### Rust compiled target cache'
+          echo
+          echo "- Workload: \`$CACHE_WORKLOAD\`"
+          echo "- Runner: \`$RUNNER_OS_VALUE / $RUNNER_ARCH_VALUE\`"
+          echo "- Target cache exact hit: \`$target_cache_hit\`"
+          echo "- Target cache matched key: \`$target_cache_matched_key\`"
+          echo "- Save key: \`$save_key\`"
+          echo "- Cache publishing enabled: \`$CACHE_SAVE_ENABLED\`"
+          echo "- Legacy fallback configured: \`$legacy_configured\`"
+          echo "- Legacy fallback invoked: \`$legacy_invoked\`"
+          echo "- Legacy fallback outcome: \`$legacy_outcome\`"
+          echo '- Legacy fallback status is separate and is not counted as target exact hit'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        {
+          echo "legacy-fallback-invoked=$legacy_invoked"
+          echo "legacy-fallback-outcome=$legacy_outcome"
+        } >> "$GITHUB_OUTPUT"
+    - name: Populate complete downloads before sharing the cache
+      if: inputs.save-if == 'true' && steps.downloads.outputs.cache-hit != 'true' && inputs.restore-downloads == 'true'
+      shell: bash
+      env:
+        CACHE_OS: ${{ runner.os }}
+      run: |
+        # 缓存由先完成的架构写入，必须预取两者的源码，不能把半份下载标成精确命中。
+        case "$CACHE_OS" in
+          Windows)
+            cargo fetch --locked --target x86_64-pc-windows-msvc --target aarch64-pc-windows-msvc
+            ;;
+          macOS)
+            cargo fetch --locked --target x86_64-apple-darwin --target aarch64-apple-darwin
+            ;;
+          *)
+            host_target="$(rustc -vV | sed -n 's/^host: //p')"
+            test -n "$host_target"
+            cargo fetch --locked --target "$host_target"
+            ;;
+        esac
+    - name: Save complete shared Cargo downloads
+      if: inputs.save-if == 'true' && steps.downloads.outputs.cache-hit != 'true' && inputs.restore-downloads == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${{ steps.identity.outputs.cargo-home }}/registry/index
+          ${{ steps.identity.outputs.cargo-home }}/registry/cache
+          ${{ steps.identity.outputs.cargo-home }}/git/db
+          ${{ steps.identity.outputs.cargo-home }}/git/checkouts
+        key: ${{ steps.downloads.outputs.cache-primary-key }}

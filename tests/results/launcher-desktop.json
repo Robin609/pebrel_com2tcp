@@ -1,0 +1,29 @@
+{
+  "Date": "2026-10-22T17:40:51+08:00",
+  "Scope": "Actual native GUI clicks for the three launcher utility actions; existing channels left stopped",
+  "Cases": [
+    {
+      "Action": "ConfigurationButton",
+      "Passed": true,
+      "Target": "F:\\tools\\com2tcp\\clients\\pebrel-data",
+      "Evidence": "Explorer breadcrumb: WorkSpace (F:) > tools > com2tcp > clients > pebrel-data; terminal_profiles.json visible"
+    },
+    {
+      "Action": "LocationLink",
+      "Passed": true,
+      "Target": "F:\\tools\\com2tcp",
+      "Evidence": "Explorer breadcrumb: WorkSpace (F:) > tools > com2tcp; launcher and build-launcher.ps1 visible"
+    },
+    {
+      "Action": "BridgeButton",
+      "Passed": true,
+      "Target": "F:\\tools\\com2tcp\\bin\\Com2Tcp.exe",
+      "ExistingWindowId": 4786866,
+      "ResultWindowId": 4786866,
+      "MatchingWindowCount": 1,
+      "RunningChannels": 0,
+      "TotalChannels": 2,
+      "Evidence": "Existing COM-TCP window reused; UI shows 0 / 2 channels running and service stopped; no start controls clicked"
+    }
+  ]
+}

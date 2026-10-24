@@ -1,0 +1,32 @@
+﻿{
+    "Date":  "2026-10-22T17:13:29",
+    "Scope":  "Real Pebrel and Ncat with temporary loopback servers; no serial device commands",
+    "Cases":  [
+                  {
+                      "Mode":  "Com11",
+                      "Port":  2011,
+                      "TcpAccepted":  true,
+                      "Utf8AndAnsiRendered":  true,
+                      "Pane":  2,
+                      "Processes":  [
+                                        "powershell.exe",
+                                        "NcConsole.exe",
+                                        "ncat.exe"
+                                    ],
+                      "Evidence":  "PEBREL_LAUNCHER_COM11_OK"
+                  },
+                  {
+                      "Mode":  "Com12",
+                      "Port":  2012,
+                      "TcpAccepted":  true,
+                      "Utf8AndAnsiRendered":  true,
+                      "Pane":  3,
+                      "Processes":  [
+                                        "powershell.exe",
+                                        "NcConsole.exe",
+                                        "ncat.exe"
+                                    ],
+                      "Evidence":  "PEBREL_LAUNCHER_COM12_OK"
+                  }
+              ]
+}

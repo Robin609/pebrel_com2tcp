@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+from pathlib import Path
+import tempfile
+import unittest
+import zipfile
+
+from scripts.stable_release import (
+    STABLE_SHA256_PLACEHOLDER,
+    StableReleaseError,
+    expected_asset_names,
+    render_notes,
+    validate_assets,
+    validate_changelog,
+    validate_notes,
+    verify_release,
+)
+from scripts.preview_release import sha256
+from scripts.preview_release import MIN_ASSET_SIZE
+from scripts.ci_plan import plan_matrices
+
+
+VERSION = "1.6.0"
+
+
+def write_fake_asset(path: Path) -> None:
+    if path.suffix == ".apk":
+        with zipfile.ZipFile(path, "w") as apk:
+            apk.writestr("AndroidManifest.xml", "fixture")
+            apk.writestr("classes.dex", b"fixture" + b"\0" * MIN_ASSET_SIZE)
+        return
+    if path.suffix == ".exe":
+        header = b"MZ" + b"\0" * 6
+    elif path.suffix == ".zip":
+        header = b"PK\x03\x04" + b"\0" * 4
+    elif path.name.endswith(".AppImage"):
+        header = b"\x7fELF\x02\x01\x01\0"
+    elif path.suffix == ".deb":
+        header = b"!<arch>\n"
+    elif path.name.endswith(".tar.gz"):
+        header = b"\x1f\x8b\x08\0\0\0\0\0"
+    elif path.suffix == ".dmg":
+        header = b"\0" * 8
+    else:
+        raise AssertionError(path)
+    path.write_bytes(header + b"\0" * (MIN_ASSET_SIZE - len(header)))
+    if path.suffix == ".dmg":
+        with path.open("r+b") as stream:
+            stream.seek(-512, 2)
+            stream.write(b"koly")
+
+
+def notes(checksum_placeholder: bool = True) -> str:
+    checksum = STABLE_SHA256_PLACEHOLDER if checksum_placeholder else "0" * 64
+    return f"""# Pebrel {VERSION}
+
+## English
+
+### Added
+- A stable package set.
+
+## 中文
+
+### 新增
+- 稳定版安装包集合。
+
+## Contributors
+
+<a href=\"https://github.com/Kuddev\"><img src=\"https://github.com/Kuddev.png?size=96\" width=\"64\" height=\"64\" alt=\"@Kuddev avatar\"></a>
+
+## SHA256
+
+{checksum}
+"""
+
+
+class StableReleaseTests(unittest.TestCase):
+    def assert_release_native_gate(self, workflow: str) -> None:
+        self.assertIn("\n  native-tests:\n", workflow)
+        native = workflow.split("\n  native-tests:\n", 1)[1].split("\n  prepare:\n", 1)[0]
+        self.assertIn("if: ${{ !inputs.windows_only }}", native)
+        self.assertIn("uses: ./.github/workflows/linux-lua.yml", native)
+        self.assertIn("actions: read", native)
+        self.assertNotIn("continue-on-error", native)
+        publish = workflow.split("\n  publish:\n", 1)[1]
+        self.assertIn("needs: [prepare, native-tests, aggregate]", publish)
+        self.assertNotIn("always()", publish)
+
+    def test_stable_workflow_requires_same_commit_native_tests_before_publication(self) -> None:
+        # tag 可以直接指向尚未进入 main 的发布提交；main 的历史绿灯不覆盖它。
+        # 复用同一套原生测试，并与打包并行；发布必须等待两者成功。
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assert_release_native_gate(workflow)
+        shared = (root / ".github/workflows/linux-lua.yml").read_text(encoding="utf-8")
+        # Platform coverage comes from the event plan, not literal runner names
+        # in YAML. Verify both the consumer wiring and the full caller matrices.
+        for output in ("native_matrix", "check_matrix"):
+            self.assertIn(f"fromJSON(needs.lint.outputs.{output})", shared)
+        self.assertIn("runs-on: ${{ matrix.os }}", shared)
+        for event in ("push", "merge_group", "workflow_call", "workflow_dispatch"):
+            with self.subTest(event=event):
+                native, release = plan_matrices(event, {})
+                self.assertCountEqual(
+                    [row["os"] for row in native],
+                    ["ubuntu-24.04", "windows-2022", "windows-11-arm", "macos-26", "macos-26-intel"],
+                )
+                self.assertCountEqual(
+                    [row["os"] for row in release], ["macos-26", "macos-26-intel"],
+                )
+        for trigger in ("pull_request:", "merge_group:", "branches: [main]"):
+            self.assertIn(trigger, shared)
+        self.assertIn("run: python scripts/ci_native_tests.py", shared)
+        self.assertIn("cargo check --locked --workspace --release", shared)
+        self.assertIn("tools/i18n-contract/Cargo.toml", shared)
+        self.assertNotIn("continue-on-error", shared)
+        aggregate = workflow.split("\n  aggregate:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        self.assertIn("needs: [prepare, linux, macos, windows, windows-arm64, android]", aggregate)
+        self.assertIn("--verify-evidence", aggregate)
+        self.assertIn("windows_arm64=True", aggregate)
+        arm = workflow.split("\n  windows-arm64:\n", 1)[1].split("\n  aggregate:\n", 1)[0]
+        for required in ("runs-on: windows-11-arm", "host: aarch64-pc-windows-msvc",
+                         "-Architecture arm64", "windows-arm64-report.json",
+                         "scripts/build-windows-product.ps1", "scripts/build-installer.ps1",
+                         "windows-arm64-setup.exe", "--platform windows-aarch64"):
+            self.assertIn(required, arm)
+        self.assertNotIn("continue-on-error", arm)
+        self.assertNotIn("always()", aggregate)
+
+    def test_release_native_gate_rejects_unvalidated_tag_publication(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        mutations = (
+            ("needs: [prepare, native-tests, aggregate]", "needs: [prepare, aggregate]"),
+            ("uses: ./.github/workflows/linux-lua.yml", "uses: ./unrelated.yml"),
+            ("  native-tests:\n    if: ${{ !inputs.windows_only }}", "  native-tests:\n    if: false"),
+            ("  native-tests:\n", "  native-tests:\n    continue-on-error: true\n"),
+        )
+        for original, replacement in mutations:
+            with self.subTest(mutation=replacement):
+                self.assertIn(original, workflow)
+                with self.assertRaises(AssertionError):
+                    self.assert_release_native_gate(workflow.replace(original, replacement, 1))
+
+    def test_native_packagers_expose_stable_channel_without_preview_id(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        linux = (root / "scripts/package-linux.sh").read_text(encoding="utf-8")
+        macos = (root / "scripts/package-macos.sh").read_text(encoding="utf-8")
+        for source in (linux, macos):
+            self.assertIn('--channel', source)
+            self.assertIn('channel" == "stable"', source)
+            self.assertIn('stable packages must not include --preview-id', source)
+        self.assertIn('asset_architecture="x64"', linux)
+        self.assertIn('asset_architecture="x64"', macos)
+        self.assertIn('asset_architecture="arm64"', macos)
+
+    def test_expected_assets_use_stable_public_names(self) -> None:
+        names = expected_asset_names(VERSION)
+        self.assertIn("Pebrel-v1.6.0-linux-x64-preview.AppImage", names)
+        self.assertIn("Pebrel-v1.6.0-macos-arm64-preview.dmg", names)
+        self.assertIn("Pebrel-v1.6.0-macos-x64-preview.dmg", names)
+        self.assertIn("Pebrel-v1.6.0-windows-x64-setup.exe", names)
+        self.assertIn("NebulaTerminal-1.6.0-windows-x64-setup.exe", names)
+        self.assertEqual(len(names), 8)
+
+    def test_stable_manifest_rejects_prerelease_versions(self) -> None:
+        with self.assertRaisesRegex(StableReleaseError, "invalid stable version"):
+            expected_asset_names("1.6.0-rc.1")
+
+    def test_17_and_later_assets_use_only_pebrel_installer(self) -> None:
+        for version in ("1.7.0", "1.7.1", "1.9.0", "1.9.1", "1.9.2", "1.10.0", "2.0.0"):
+            with self.subTest(version=version):
+                names = expected_asset_names(version)
+                parsed = tuple(map(int, version.split('.')))
+                self.assertEqual(len(names), 10 if parsed >= (2, 0, 0) else 9 if parsed >= (1, 9, 2) else 8 if parsed >= (1, 9, 0) else 7)
+                self.assertIn(f"Pebrel-v{version}-windows-x64-setup.exe", names)
+                self.assertNotIn(f"NebulaTerminal-{version}-windows-x64-setup.exe", names)
+
+    def test_19_requires_native_windows_arm64_without_changing_historical_assets(self) -> None:
+        self.assertNotIn("Pebrel-v1.8.2-windows-arm64.zip", expected_asset_names("1.8.2"))
+        version = "1.9.0"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in expected_asset_names(version):
+                write_fake_asset(root / name)
+            self.assertEqual(len(validate_assets(root, version)), 8)
+            (root / "Pebrel-v1.9.0-windows-arm64.zip").unlink()
+            with self.assertRaisesRegex(StableReleaseError, "missing: Pebrel-v1.9.0-windows-arm64.zip"):
+                validate_assets(root, version)
+
+    def test_20_requires_valid_android_apk_without_changing_historical_assets(self) -> None:
+        for version in ("1.9.0", "1.9.1", "1.9.2", "1.10.0"):
+            self.assertFalse(any(name.endswith(".apk") for name in expected_asset_names(version)))
+        version = "2.0.0"
+        name = "Pebrel-v2.0.0-android-universal-preview.apk"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for asset in expected_asset_names(version):
+                write_fake_asset(root / asset)
+            self.assertEqual(len(validate_assets(root, version)), 10)
+            (root / name).unlink()
+            with self.assertRaisesRegex(StableReleaseError, "missing: " + name):
+                validate_assets(root, version)
+            (root / name).write_bytes(b"PK\x03\x04" + b"x" * MIN_ASSET_SIZE)
+            with self.assertRaisesRegex(StableReleaseError, "invalid ZIP structure"):
+                validate_assets(root, version)
+            with zipfile.ZipFile(root / name, "w") as apk:
+                apk.writestr("not-an-app", b"x" * MIN_ASSET_SIZE)
+            with self.assertRaisesRegex(StableReleaseError, "manifest or DEX"):
+                validate_assets(root, version)
+
+    def test_offline_relay_is_required_for_future_releases_not_existing_211_assets(self) -> None:
+        self.assertFalse(any("relay-manual" in name for name in expected_asset_names("2.1.1")))
+        version = "2.1.2"
+        name = f"Pebrel-v{version}-relay-manual.tar.gz"
+        self.assertIn(name, expected_asset_names(version))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for asset in expected_asset_names(version):
+                write_fake_asset(root / asset)
+            self.assertEqual(len(validate_assets(root, version)), 11)
+            (root / name).unlink()
+            with self.assertRaisesRegex(StableReleaseError, "missing:"):
+                validate_assets(root, version)
+
+    def test_post_191_requires_native_windows_arm64_installer(self) -> None:
+        for version in ("1.9.0", "1.9.1"):
+            with self.subTest(historical_version=version):
+                self.assertNotIn(
+                    f"Pebrel-v{version}-windows-arm64-setup.exe",
+                    expected_asset_names(version),
+                )
+        for version in ("1.9.2", "1.10.0", "2.0.0"):
+            with self.subTest(version=version):
+                self.assertIn(
+                    f"Pebrel-v{version}-windows-arm64-setup.exe",
+                    expected_asset_names(version),
+                )
+        version = "1.9.2"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in expected_asset_names(version):
+                write_fake_asset(root / name)
+            self.assertEqual(len(validate_assets(root, version)), 9)
+            (root / f"Pebrel-v{version}-windows-arm64-setup.exe").unlink()
+            with self.assertRaisesRegex(StableReleaseError, "missing: Pebrel-v1.9.2-windows-arm64-setup.exe"):
+                validate_assets(root, version)
+
+    def test_17_assets_reject_retired_alias_and_missing_installer(self) -> None:
+        version = "1.7.0"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in expected_asset_names(version):
+                if name.startswith("Pebrel-"):
+                    write_fake_asset(root / name)
+            self.assertEqual(len(validate_assets(root, version)), 7)
+            legacy = root / "NebulaTerminal-1.7.0-windows-x64-setup.exe"
+            write_fake_asset(legacy)
+            with self.assertRaisesRegex(StableReleaseError, "unexpected: NebulaTerminal"):
+                validate_assets(root, version)
+            legacy.unlink()
+            (root / "Pebrel-v1.7.0-windows-x64-setup.exe").unlink()
+            with self.assertRaisesRegex(StableReleaseError, "missing: Pebrel-v1.7.0-windows-x64-setup.exe"):
+                validate_assets(root, version)
+
+    def test_17_notes_require_only_current_asset_names(self) -> None:
+        version = "1.7.0"
+        checksums = "\n".join(
+            f"- `{name}`: `PENDING FINAL BUILD`"
+            for name in expected_asset_names(version) if name.startswith("Pebrel-")
+        )
+        body = notes().replace(VERSION, version).replace(STABLE_SHA256_PLACEHOLDER, checksums)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "v1.7.0.md"
+            source.write_text(body, encoding="utf-8")
+            self.assertEqual(validate_notes(source, version), body)
+            source.write_text(
+                body + "- `NebulaTerminal-1.7.0-windows-x64-setup.exe`: `PENDING FINAL BUILD`\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(StableReleaseError, "unexpected: NebulaTerminal"):
+                validate_notes(source, version)
+
+    def test_complete_assets_require_identical_legacy_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in expected_asset_names(VERSION):
+                write_fake_asset(root / name)
+            self.assertEqual(len(validate_assets(root, VERSION)), 8)
+            legacy = root / "NebulaTerminal-1.6.0-windows-x64-setup.exe"
+            legacy.write_bytes(legacy.read_bytes()[:-1] + b"x")
+            with self.assertRaisesRegex(StableReleaseError, "byte-identical"):
+                validate_assets(root, VERSION)
+
+    def test_asset_magic_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in expected_asset_names(VERSION):
+                write_fake_asset(root / name)
+            (root / "Pebrel-v1.6.0-linux-x64-preview.AppImage").write_bytes(b"bad" + b"\0" * MIN_ASSET_SIZE)
+            with self.assertRaisesRegex(StableReleaseError, "ELF"):
+                validate_assets(root, VERSION)
+
+    def test_notes_require_bilingual_categories_and_contributor_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "v1.6.0.md"
+            source.write_text(notes(), encoding="utf-8")
+            self.assertEqual(validate_notes(source, VERSION), notes())
+            source.write_text(notes().replace("https://github.com/Kuddev", "https://example.invalid"), encoding="utf-8")
+            with self.assertRaisesRegex(StableReleaseError, "GitHub links"):
+                validate_notes(source, VERSION)
+
+    def test_notes_allow_no_pr_contributors_but_keep_section_contracts(self) -> None:
+        before, rest = notes().split("## Contributors\n", 1)
+        contributor_body, after = rest.split("## SHA256\n", 1)
+        without_contributors = before + "## SHA256\n" + after
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "notes.md"
+            source.write_text(without_contributors, encoding="utf-8")
+            self.assertEqual(validate_notes(source, VERSION), without_contributors)
+            invalid = (
+                (before + "## Contributors\n\n## SHA256\n" + after, "GitHub links"),
+                (notes().replace("## Contributors", "## Contributors\n\n## Contributors"), "at most one"),
+                (without_contributors + "\n## Contributors\n" + contributor_body, "out of order"),
+                (without_contributors.replace("### 新增", "### 修复"), "matching bilingual"),
+                (without_contributors.replace("## 中文", "## Chinese"), "require one"),
+            )
+            for body, error in invalid:
+                with self.subTest(error=error):
+                    source.write_text(body, encoding="utf-8")
+                    with self.assertRaisesRegex(StableReleaseError, error):
+                        validate_notes(source, VERSION)
+
+    def test_changelog_must_list_the_same_stable_asset_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "CHANGELOG.md"
+            source.write_text(
+                "## 1.6.0 - 2026-09-07\n\n"
+                + "\n".join(f"- `{name}`: `PENDING FINAL BUILD`" for name in expected_asset_names(VERSION))
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(validate_changelog(source, VERSION))
+            source.write_text(source.read_text(encoding="utf-8").replace("Pebrel-v1.6.0", "Pebrel-1.6.0"), encoding="utf-8")
+            with self.assertRaisesRegex(StableReleaseError, "missing stable asset"):
+                validate_changelog(source, VERSION)
+
+    def test_render_notes_replaces_placeholder_with_all_hashes(self) -> None:
+        rendered = render_notes(notes(), "a" * 64 + "  Pebrel-v1.6.0-windows-x64.zip\n")
+        self.assertNotIn(STABLE_SHA256_PLACEHOLDER, rendered)
+        self.assertIn("a" * 64 + "  Pebrel-v1.6.0-windows-x64.zip", rendered)
+
+    def test_render_notes_replaces_pending_named_entries(self) -> None:
+        source = notes().replace(STABLE_SHA256_PLACEHOLDER, "- `Pebrel-v1.6.0-windows-x64.zip`: `PENDING FINAL BUILD`")
+        rendered = render_notes(source, "a" * 64 + "  Pebrel-v1.6.0-windows-x64.zip\n")
+        self.assertIn("`Pebrel-v1.6.0-windows-x64.zip`: `" + "a" * 64, rendered)
+
+    def test_render_notes_rejects_stale_explicit_hashes(self) -> None:
+        with self.assertRaisesRegex(StableReleaseError, "stale or incomplete"):
+            render_notes(notes(False), "a" * 64 + "  Pebrel-v1.6.0-windows-x64.zip\n")
+
+    def test_remote_release_verification_checks_all_assets_and_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in expected_asset_names(VERSION):
+                write_fake_asset(root / name)
+            (root / "SHA256SUMS").write_text("checksums\n", encoding="utf-8")
+            release_notes = notes().replace(STABLE_SHA256_PLACEHOLDER, "rendered checksums")
+            (root / "RELEASE_NOTES.md").write_text(release_notes, encoding="utf-8")
+            names = [*expected_asset_names(VERSION), "SHA256SUMS"]
+            metadata = {
+                "name": "Pebrel 1.6.0",
+                "tag_name": "v1.6.0",
+                "draft": False,
+                "prerelease": False,
+                "body": release_notes,
+                "assets": [
+                    {
+                        "name": name,
+                        "label": "",
+                        "state": "uploaded",
+                        "size": (root / name).stat().st_size,
+                        "digest": f"sha256:{sha256(root / name)}",
+                    }
+                    for name in names
+                ],
+            }
+            verify_release(metadata, root, VERSION, "a" * 40, "a" * 40)
+            metadata["body"] = release_notes.replace("\n", "\r\n")
+            verify_release(metadata, root, VERSION, "a" * 40, "a" * 40)
+            metadata["assets"][0]["label"] = "wrong"
+            with self.assertRaisesRegex(StableReleaseError, "label"):
+                verify_release(metadata, root, VERSION, "a" * 40, "a" * 40)
+
+
+if __name__ == "__main__":
+    unittest.main()

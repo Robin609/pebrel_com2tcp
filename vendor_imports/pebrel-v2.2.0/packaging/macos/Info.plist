@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+    <string>zh-Hant</string>
+    <string>fr</string>
+    <string>de</string>
+    <string>es</string>
+    <string>pt-BR</string>
+    <string>it</string>
+    <string>ru</string>
+    <string>ja</string>
+    <string>ko</string>
+  </array>
+  <key>CFBundleDisplayName</key>
+  <string>Pebrel Preview</string>
+  <key>CFBundleExecutable</key>
+  <string>pebrel</string>
+  <key>CFBundleIconFile</key>
+  <string>pebrel.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.kuddev.pebrel.preview</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Pebrel Preview</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleGetInfoString</key>
+  <string>Pebrel Preview</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true />
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>CFBundleDocumentTypes</key>
+  <array><dict>
+    <key>CFBundleTypeName</key><string>Folder</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+  </dict></array>
+</dict>
+</plist>

@@ -1,0 +1,590 @@
+use log::{info, warn};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::io::{Error, Result};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::{Path, PathBuf};
+use std::{mem, ptr};
+
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, FreeLibrary, HANDLE, HMODULE, S_OK,
+};
+use windows_sys::Win32::Globalization::{
+    CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal,
+};
+use windows_sys::Win32::System::Console::{
+    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::core::{HRESULT, PWSTR};
+use windows_sys::s;
+
+use windows_sys::Win32::System::Threading::{
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, UpdateProcThreadAttribute,
+};
+
+use crate::event::{OnResize, WindowSize};
+use crate::tty::Options;
+use crate::tty::windows::blocking::{UnblockedReader, UnblockedWriter};
+use crate::tty::windows::child::ChildExitWatcher;
+use crate::tty::windows::{Pty, cmdline, win32_string};
+
+const PIPE_CAPACITY: usize = crate::event_loop::READ_BUFFER_SIZE;
+
+/// Load the pseudoconsole API from conpty.dll if possible, otherwise use the
+/// standard Windows API.
+///
+/// The bundled conpty.dll (provenance: THIRD-PARTY-NOTICES)
+/// supports loading OpenConsole.exe, which offers many improvements and
+/// bugfixes compared to the standard conpty that ships with Windows.
+///
+/// The conpty.dll and OpenConsole.exe files will be searched in PATH and in
+/// the directory where Nebula's executable is located.
+type CreatePseudoConsoleFn =
+    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
+type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
+type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
+
+struct ConptyApi {
+    create: CreatePseudoConsoleFn,
+    resize: ResizePseudoConsoleFn,
+    close: ClosePseudoConsoleFn,
+    /// Whether these entry points come from the side-loaded conpty.dll
+    /// (bundled OpenConsole) rather than the in-box kernel32 ConPTY —
+    /// gates the DA1 handshake priming in `new`.
+    sideloaded: bool,
+    // Keep the loaded code alive through ClosePseudoConsole, including when
+    // several PTYs share the same DLL. Each LoadLibrary owns one reference.
+    _library: Option<ConptyLibrary>,
+}
+
+struct ConptyLibrary(HMODULE);
+
+impl Drop for ConptyLibrary {
+    fn drop(&mut self) {
+        unsafe { FreeLibrary(self.0) };
+    }
+}
+
+impl ConptyApi {
+    fn new() -> Self {
+        // Side-by-side conpty.dll + OpenConsole.exe is the DEFAULT: the
+        // bundled host avoids in-box ConPTY's resize viewport re-emit quirks,
+        // which is a stability/correctness call. `openconsole=off` in
+        // nebula_settings.txt opts out for faster pane spawn (the unsigned
+        // exe pays Defender's real-time scan) at the cost of relying purely
+        // on Nebula's own resize coalescing to keep TUIs clean.
+        let sideload = super::conpty_sideload_enabled();
+
+        match sideload.then(Self::load_conpty).flatten() {
+            Some(conpty) => {
+                info!("Using conpty.dll (OpenConsole) for pseudoconsole");
+                conpty
+            },
+            None => {
+                info!("Using Windows API for pseudoconsole");
+                Self {
+                    create: CreatePseudoConsole,
+                    resize: ResizePseudoConsole,
+                    close: ClosePseudoConsole,
+                    sideloaded: false,
+                    _library: None,
+                }
+            },
+        }
+    }
+
+    /// Try loading ConptyApi from conpty.dll library.
+    fn load_conpty() -> Option<Self> {
+        type LoadedFn = unsafe extern "system" fn() -> isize;
+
+        // 只接受同一候选目录中的完整文件对，避免把半套 runtime 与根目录混用。
+        // DLL 始终按绝对路径加载，不能让 PATH 中的同名文件进入认证边界。
+        let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let Some(conpty_dir) = bundled_conpty_dir(&exe_dir) else {
+            info!(
+                "complete conpty.dll/OpenConsole.exe pair not found in runtime/ or executable directory; using in-box ConPTY"
+            );
+            return None;
+        };
+        let dll_path = conpty_dir.join("conpty.dll");
+        let dll_wide: Vec<u16> =
+            dll_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+        unsafe {
+            let hmodule = LoadLibraryW(dll_wide.as_ptr());
+            if hmodule.is_null() {
+                return None;
+            }
+            let library = ConptyLibrary(hmodule);
+            let create_fn = GetProcAddress(hmodule, s!("CreatePseudoConsole"))?;
+            let resize_fn = GetProcAddress(hmodule, s!("ResizePseudoConsole"))?;
+            let close_fn = GetProcAddress(hmodule, s!("ClosePseudoConsole"))?;
+
+            Some(Self {
+                create: mem::transmute::<LoadedFn, CreatePseudoConsoleFn>(create_fn),
+                resize: mem::transmute::<LoadedFn, ResizePseudoConsoleFn>(resize_fn),
+                close: mem::transmute::<LoadedFn, ClosePseudoConsoleFn>(close_fn),
+                sideloaded: true,
+                _library: Some(library),
+            })
+        }
+    }
+}
+
+fn bundled_conpty_dir(exe_dir: &Path) -> Option<PathBuf> {
+    [exe_dir.join("runtime"), exe_dir.to_path_buf()]
+        .into_iter()
+        .find(|dir| dir.join("conpty.dll").is_file() && dir.join("OpenConsole.exe").is_file())
+}
+
+/// RAII Pseudoconsole.
+pub struct Conpty {
+    pub handle: HPCON,
+    api: ConptyApi,
+}
+
+impl Drop for Conpty {
+    fn drop(&mut self) {
+        // XXX: This will block until the conout pipe is drained. Will cause a deadlock if the
+        // conout pipe has already been dropped by this point.
+        //
+        // See https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
+        unsafe { (self.api.close)(self.handle) }
+    }
+}
+
+// The ConPTY handle can be sent between threads.
+unsafe impl Send for Conpty {}
+
+pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
+    // ConPTY decodes CSI ... _ records into native INPUT_RECORDs. This is
+    // required for functional chords such as Codex's Shift+Enter, while
+    // ordinary character input still remains on the normal UTF-8 path.
+    const PSEUDOCONSOLE_WIN32_INPUT_MODE: u32 = 0x4;
+
+    let api = ConptyApi::new();
+    crate::pty_trace(if api.sideloaded {
+        "conpty api ready (sideloaded OpenConsole)"
+    } else {
+        "conpty api ready (in-box)"
+    });
+    let mut pty_handle: HPCON = 0;
+
+    // Passing 0 as the size parameter allows the "system default" buffer
+    // size to be used. There may be small performance and memory advantages
+    // to be gained by tuning this in the future, but it's likely a reasonable
+    // start point.
+    let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
+    let (conin_pty_handle, mut conin) = miow::pipe::anonymous(0)?;
+
+    // Prime the side-loaded OpenConsole's startup handshake: at boot it sends
+    // a DA1 query and holds parts of its init until the terminal answers.
+    // Pre-writing the VT100 DA1 response into the input pipe — before the
+    // host is even spawned, so it's the first thing it reads — makes the
+    // handshake instant instead of a per-pane wait; the same trick
+    // Microsoft's own ConPTY tests use. ONLY for the bundled host: the
+    // in-box ConPTY may not consume an unsolicited report and would leak
+    // `ESC[?61c` into the shell as typed input.
+    if api.sideloaded {
+        use std::io::Write;
+        let _ = conin.write_all(b"\x1b[?61c");
+        crate::pty_trace("DA1 response primed");
+    }
+
+    // Create the Pseudo Console, using the pipes. Win32 input mode (0x4) is
+    // an OpenConsole-era flag: the bundled host always understands it, while
+    // the in-box ConPTY only does on newer Windows builds and fails
+    // CreatePseudoConsole with E_INVALIDARG on older ones. Retry without the
+    // flag instead of dying — a host created flagless never issues DECSET
+    // 9001, the terminal never sets WIN32_INPUT_MODE, and the encoder stays
+    // on the legacy VT path, so the degradation is self-gating end to end.
+    let conin_handle = conin_pty_handle.as_raw_handle() as HANDLE;
+    let conout_handle = conout_pty_handle.as_raw_handle() as HANDLE;
+    let mut result = unsafe {
+        (api.create)(
+            window_size.into(),
+            conin_handle,
+            conout_handle,
+            PSEUDOCONSOLE_WIN32_INPUT_MODE,
+            &mut pty_handle as *mut _,
+        )
+    };
+    if result != S_OK {
+        warn!(
+            "CreatePseudoConsole rejected win32 input mode (HRESULT {result:#x}); \
+             retrying in legacy VT input mode"
+        );
+        crate::pty_trace("CreatePseudoConsole win32-input rejected; legacy retry");
+        result = unsafe {
+            (api.create)(
+                window_size.into(),
+                conin_handle,
+                conout_handle,
+                0,
+                &mut pty_handle as *mut _,
+            )
+        };
+    }
+    crate::pty_trace("CreatePseudoConsole done");
+
+    // ConPTY duplicates these handles; it does not take ownership of ours.
+    // Retaining our output writer prevents EOF even after the host exits,
+    // stranding both the reader/drain threads and their bounded pipe buffer.
+    drop(conin_pty_handle);
+    drop(conout_pty_handle);
+
+    if result != S_OK {
+        return Err(Error::other(format!("CreatePseudoConsole failed: HRESULT {result:#x}")));
+    }
+
+    let mut conout = UnblockedReader::new(conout, PIPE_CAPACITY);
+    // Declared after conout so every error closes the host while its reader
+    // still exists. Spawn failures need the same drain-before-close order as Pty.
+    let conpty = Conpty { handle: pty_handle, api };
+    let child_watcher = match spawn_shell(config, &conpty) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            conout.drain_detached();
+            return Err(error);
+        },
+    };
+    let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
+
+    Ok(Pty::new(conpty, conout, conin, child_watcher))
+}
+
+fn spawn_shell(config: &Options, conpty: &Conpty) -> Result<ChildExitWatcher> {
+    let mut attributes = ProcThreadAttributes::new()?;
+    let mut startup_info_ex: STARTUPINFOEXW = unsafe { mem::zeroed() };
+    startup_info_ex.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Null standard handles and disabled inheritance keep parent handles private.
+    startup_info_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info_ex.lpAttributeList = attributes.as_mut_ptr();
+
+    // Set thread attribute list's Pseudo Console to the specified ConPTY.
+    unsafe {
+        let success = UpdateProcThreadAttribute(
+            startup_info_ex.lpAttributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+            conpty.handle as *mut std::ffi::c_void,
+            mem::size_of::<HPCON>(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ) > 0;
+
+        if !success {
+            return Err(Error::last_os_error());
+        }
+    }
+
+    // Prepare child process creation arguments.
+    let mut cmdline = win32_string(&cmdline(config));
+    let cwd = config.working_directory.as_ref().map(win32_string);
+    let mut creation_flags = EXTENDED_STARTUPINFO_PRESENT;
+    let child_config = super::cmd_prompt::prepare(config);
+    let custom_env_block = convert_custom_env(&child_config.env, child_config.env_is_complete);
+    let custom_env_block_pointer = match &custom_env_block {
+        Some(custom_env_block) => {
+            creation_flags |= CREATE_UNICODE_ENVIRONMENT;
+            custom_env_block.as_ptr() as *mut std::ffi::c_void
+        },
+        None => ptr::null_mut(),
+    };
+
+    let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    crate::pty_trace("CreateProcessW (shell attach) begin");
+    unsafe {
+        let success = CreateProcessW(
+            ptr::null(),
+            cmdline.as_mut_ptr() as PWSTR,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            false as i32,
+            creation_flags,
+            custom_env_block_pointer,
+            cwd.as_ref().map_or_else(ptr::null, |s| s.as_ptr()),
+            &mut startup_info_ex.StartupInfo as *mut STARTUPINFOW,
+            &mut proc_info as *mut PROCESS_INFORMATION,
+        ) > 0;
+
+        if !success {
+            return Err(Error::last_os_error());
+        }
+    }
+    crate::pty_trace("CreateProcessW (shell attach) done");
+
+    // CreateProcess returns two caller-owned handles, even though the primary
+    // thread needs no further interaction. The watcher owns the process handle.
+    let process = unsafe { OwnedHandle::from_raw_handle(proc_info.hProcess) };
+    let thread = unsafe { OwnedHandle::from_raw_handle(proc_info.hThread) };
+    drop(thread);
+    ChildExitWatcher::new(process)
+}
+
+struct ProcThreadAttributes {
+    // The opaque native list requires pointer alignment, not byte alignment.
+    storage: Box<[usize]>,
+}
+
+impl ProcThreadAttributes {
+    fn new() -> Result<Self> {
+        let mut size = 0;
+        let success =
+            unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
+        let error = Error::last_os_error();
+        if success != 0 || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(error);
+        }
+        let mut storage = vec![0_usize; size.div_ceil(mem::size_of::<usize>())].into_boxed_slice();
+        if unsafe {
+            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 1, 0, &mut size)
+        } == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        Ok(Self { storage })
+    }
+
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.storage.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for ProcThreadAttributes {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
+
+// Windows environment variables are case-insensitive, and the caller is responsible for
+// deduplicating environment variables, so do that here while converting.
+//
+// https://learn.microsoft.com/en-us/previous-versions/troubleshoot/windows/win32/createprocess-cannot-eliminate-duplicate-variables#environment-variables
+fn convert_custom_env(
+    custom_env: &HashMap<String, String>,
+    env_is_complete: bool,
+) -> Option<Vec<u16>> {
+    // Windows inherits parent's env when no `lpEnvironment` parameter is specified.
+    if custom_env.is_empty() && !env_is_complete {
+        return None;
+    }
+
+    let mut environment = Vec::new();
+    for (custom_key, custom_value) in custom_env {
+        environment.push(PendingEnvironmentVariable::new(
+            OsStr::new(custom_key),
+            OsStr::new(custom_value),
+        ));
+    }
+
+    if !env_is_complete {
+        // Pull the current process environment after, to avoid overwriting the user provided one.
+        for (inherited_key, inherited_value) in std::env::vars_os() {
+            environment.push(PendingEnvironmentVariable::new(&inherited_key, &inherited_value));
+        }
+    }
+
+    // CreateProcess 要求按大小写不敏感的 Unicode 顺序排列。稳定排序还会让自定义
+    // 项在同名继承项之前，从而保住覆盖优先级。
+    environment.sort_by(|left, right| compare_environment_names(&left.key_wide, &right.key_wide));
+
+    let mut converted_block = Vec::new();
+    let mut previous_key = None::<Vec<u16>>;
+    for variable in environment {
+        if previous_key.as_ref().is_some_and(|previous| {
+            compare_environment_names(previous, &variable.key_wide) == Ordering::Equal
+        }) {
+            warn!(
+                "Omitting environment variable pair with duplicate key: '{}={}'",
+                variable.key.to_string_lossy(),
+                variable.value.to_string_lossy()
+            );
+            continue;
+        }
+        add_windows_env_key_value_to_block(&mut converted_block, &variable.key, &variable.value);
+        previous_key = Some(variable.key_wide);
+    }
+
+    // 即使调用方有意传空环境，环境块也必须以双 NUL 结尾。
+    if converted_block.is_empty() {
+        converted_block.push(0);
+    }
+    converted_block.push(0);
+    Some(converted_block)
+}
+
+struct PendingEnvironmentVariable {
+    key: OsString,
+    value: OsString,
+    key_wide: Vec<u16>,
+}
+
+impl PendingEnvironmentVariable {
+    fn new(key: &OsStr, value: &OsStr) -> Self {
+        Self {
+            key: key.to_os_string(),
+            value: value.to_os_string(),
+            key_wide: key.encode_wide().collect(),
+        }
+    }
+}
+
+fn compare_environment_names(left: &[u16], right: &[u16]) -> Ordering {
+    let result = unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left.len() as i32,
+            right.as_ptr(),
+            right.len() as i32,
+            1,
+        )
+    };
+    match result {
+        CSTR_LESS_THAN => Ordering::Less,
+        CSTR_EQUAL => Ordering::Equal,
+        CSTR_GREATER_THAN => Ordering::Greater,
+        // 环境变量名受 CreateProcess 环境块上限约束，正常不会失败；异常时仍给出
+        // 全序，不能让排序过程 panic。
+        _ => left.cmp(right),
+    }
+}
+
+// According to the `lpEnvironment` parameter description:
+// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa#parameters
+//
+// > An environment block consists of a null-terminated block of null-terminated strings. Each
+// string is in the following form:
+// >
+// > name=value\0
+fn add_windows_env_key_value_to_block(block: &mut Vec<u16>, key: &OsStr, value: &OsStr) {
+    block.extend(key.encode_wide());
+    block.push('=' as u16);
+    block.extend(value.encode_wide());
+    block.push(0);
+}
+
+impl OnResize for Conpty {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        // A failed resize (e.g. racing a pane teardown, or the host died) must
+        // not take the whole process down — log and let the exit path handle it.
+        let result = unsafe { (self.api.resize)(self.handle, window_size.into()) };
+        if result != S_OK {
+            // stderr 兜底：GPUI 主窗形态没有装 logger，失败不能无声。
+            eprintln!("[nebula:conpty] ResizePseudoConsole failed: HRESULT {result:#x}");
+            warn!("ResizePseudoConsole failed: HRESULT {result:#x}");
+        }
+    }
+}
+
+impl From<WindowSize> for COORD {
+    fn from(window_size: WindowSize) -> Self {
+        let lines = window_size.num_lines;
+        let columns = window_size.num_cols;
+        COORD { X: columns as i16, Y: lines as i16 }
+    }
+}
+
+#[cfg(test)]
+mod runtime_asset_tests {
+    use super::{bundled_conpty_dir, convert_custom_env};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("nebula-conpty-{name}-{}-{sequence}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_pair(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("conpty.dll"), b"dll").unwrap();
+        std::fs::write(dir.join("OpenConsole.exe"), b"host").unwrap();
+    }
+
+    #[test]
+    fn conpty_prefers_complete_runtime_pair() {
+        let dir = TestDir::new("runtime");
+        write_pair(dir.path());
+        write_pair(&dir.path().join("runtime"));
+
+        assert_eq!(bundled_conpty_dir(dir.path()), Some(dir.path().join("runtime")));
+    }
+
+    #[test]
+    fn conpty_does_not_mix_partial_runtime_with_legacy_pair() {
+        let dir = TestDir::new("partial");
+        write_pair(dir.path());
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("conpty.dll"), b"dll-only").unwrap();
+
+        assert_eq!(bundled_conpty_dir(dir.path()), Some(dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn conpty_returns_none_without_complete_pair() {
+        let dir = TestDir::new("missing");
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("OpenConsole.exe"), b"host-only").unwrap();
+
+        assert_eq!(bundled_conpty_dir(dir.path()), None);
+    }
+
+    #[test]
+    fn complete_environment_does_not_restore_parent_variables() {
+        let custom = HashMap::from([("NEBULA_REFRESH_TEST".to_owned(), "fresh".to_owned())]);
+        let block = convert_custom_env(&custom, true).expect("environment block");
+        let entries: Vec<String> = block
+            .split(|character| *character == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect();
+
+        assert_eq!(entries, vec!["NEBULA_REFRESH_TEST=fresh"]);
+    }
+
+    #[test]
+    fn complete_environment_block_is_sorted_case_insensitively() {
+        let custom = HashMap::from([
+            ("z-last".to_owned(), "3".to_owned()),
+            ("Middle".to_owned(), "2".to_owned()),
+            ("a-first".to_owned(), "1".to_owned()),
+        ]);
+        let block = convert_custom_env(&custom, true).expect("environment block");
+        let entries: Vec<String> = block
+            .split(|character| *character == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect();
+
+        assert_eq!(entries, vec!["a-first=1", "Middle=2", "z-last=3"]);
+    }
+}

@@ -1,0 +1,45 @@
+# Screen-chrome evidence for this CLI (idle / working / blocked).
+id = "codex"
+
+# High-confidence startup chrome. This is the cross-host fallback for panes
+# whose real process lives behind WSL/SSH and cannot appear in the Windows
+# Toolhelp tree. Keep identity signatures brand-specific: status rules such as
+# the bare `›` prompt are intentionally too generic to establish identity.
+[[identity]]
+contains = ["openai codex"]
+
+# A restored conversation can omit the startup banner. Require its branded
+# empty prompt immediately followed by the live model/effort footer at the tail.
+[[identity]]
+regex = ['(?m)^[ \t]*› Ask Codex to do anything[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\S+[ \t]+(?:minimal|low|medium|high|xhigh|max)[ \t]*[·•][^\r\n]*\s*\z']
+
+[[rules]]
+id = "strong_blocker"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(12)"
+any = [
+  { contains = ["press enter to confirm or esc to cancel"] },
+  { contains = ["enter to submit answer"] },
+  { contains = ["enter to submit all"] },
+  { contains = ["allow command?"] },
+  { contains = ["tab to add notes", "enter to submit"] },
+]
+
+[[rules]]
+id = "working_status"
+state = "working"
+priority = 400
+region = "bottom_non_empty_lines(16)"
+any = [
+  { line_regex = ['^[•◦]\s+(?:Working|Compacting context) \([^)]*esc to interrupt\)(?: · .*)?$'] },
+  { line_regex = ['^[•◦]\s+Messages to be submitted after next tool call \(press esc to interrupt and send immediately\)$'] },
+]
+
+[[rules]]
+id = "prompt_idle"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^\s*›(?:\s|$)']
+not = [{ contains = ["esc to interrupt"] }]

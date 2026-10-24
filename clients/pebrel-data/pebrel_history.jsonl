@@ -1,0 +1,21 @@
+{"ts":1792032771,"cwd":"F:\\tools\\com2tcp","cmd":"nc 127.0.0.1 2012"}
+{"ts":1792033108,"cwd":"F:\\tools\\com2tcp","cmd":"chcp 65001"}
+{"ts":1792033111,"cwd":"F:\\tools\\com2tcp","cmd":"nc 127.0.0.1 2012"}
+{"ts":1792033335,"cwd":"F:\\tools\\com2tcp","cmd":"[pscustomobject]@{InputCodePage=[Console]::InputEncoding.CodePage;OutputCodePage=[Console]::OutputEncoding.CodePage;PipeCodePage=$OutputEncoding.CodePage}; chcp.com"}
+{"ts":1792033349,"cwd":"F:\\tools\\com2tcp","cmd":"nc 127.0.0.1 2012"}
+{"ts":1792034010,"cwd":"F:\\tools\\com2tcp\\clients","cmd":"[pscustomobject]@{InputCodePage=[Console]::InputEncoding.CodePage;OutputCodePage=[Console]::OutputEncoding.CodePage;PipeCodePage=$OutputEncoding.CodePage}; chcp.com"}
+{"ts":1792034655,"cwd":"F:\\tools\\com2tcp","cmd":"ls"}
+{"ts":1792036390,"cwd":"F:\\tools\\com2tcp","cmd":"ssh 192.168.2.65"}
+{"ts":1792036452,"cwd":"F:\\tools\\com2tcp","cmd":"nc 127.0.0.1 2012"}
+{"ts":1792043605,"cwd":"F:\\tools\\com2tcp","cmd":"ssh 192.168.2.65"}
+{"ts":1792043656,"cwd":"F:\\tools\\com2tcp","cmd":"ssh-keygen -R 192.168.2.65"}
+{"ts":1792043668,"cwd":"F:\\tools\\com2tcp","cmd":"ssh cat@192.168.2.65"}
+{"ts":1792043981,"cwd":"F:\\tools\\com2tcp","cmd":"ssh robin@192.168.2.65"}
+{"ts":1792044192,"cwd":"F:\\tools\\com2tcp","cmd":"ssh robin001210@34.81.53.191"}
+{"ts":1792045330,"cwd":"F:\\tools\\com2tcp","cmd":"ssh gcp-ros2"}
+{"ts":1792069317,"cwd":"F:\\tools\\com2tcp","cmd":"ssh root@192.168.2.20"}
+{"ts":1792069321,"cwd":"F:\\tools\\com2tcp","cmd":"root"}
+{"ts":1792069330,"cwd":"F:\\tools\\com2tcp","cmd":"ssh root@192.168.2.20"}
+{"ts":1792660167,"cwd":"F:\\tools\\com2tcp","cmd":"Write-Output (\"PEBREL_LAUNCHER_UTF8=\" + [Console]::InputEncoding.CodePage + \",\" + [Console]::OutputEncoding.CodePage + \",\" + $OutputEncoding.CodePage)"}
+{"ts":1792661777,"cwd":"F:\\tools\\com2tcp","cmd":"ssh admin@45.116.78.6"}
+{"ts":1792661865,"cwd":"F:\\tools\\com2tcp","cmd":"ssh root@45.116.78.6"}

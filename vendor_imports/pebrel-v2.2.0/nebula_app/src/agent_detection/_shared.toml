@@ -1,0 +1,36 @@
+# Fallback rules for clients without complete lifecycle hooks. All blocked
+# candidates also pass ai_agents::screen_context's live-control/form boundary.
+# Shared rules describe keyboard chrome; words in assistant output are not events.
+
+[[rules]]
+id = "shared_binary_confirmation"
+state = "blocked"
+priority = 800
+region = "bottom_non_empty_lines(1)"
+line_regex = ['(?i)^\p{L}[^\n]*[?:]\s*(?:\(\s*y(?:es)?\s*/\s*n(?:o)?\s*\)|\[\s*y(?:es)?\s*/\s*n(?:o)?\s*\])\s*[:?]?\s*$']
+
+[[rules]]
+id = "shared_awaiting_answer"
+state = "blocked"
+priority = 800
+region = "bottom_non_empty_lines(3)"
+any = [
+  { line_regex = ['(?i)^\s*(?:press\s+)?(?:enter|↵)\s+(?:to\s+)?(?:confirm|submit|select)\b'] },
+  { line_regex = ['(?i)^\s*(?:esc|tab|↑/?↓).*\b(?:enter\s+(?:to\s+)?(?:confirm|submit|select)|tab\s+(?:to\s+)?amend)\b'] },
+]
+
+[[rules]]
+id = "shared_interrupt_hint_working"
+state = "working"
+priority = 350
+region = "bottom_non_empty_lines(3)"
+any = [
+  { line_regex = ['(?i)^\s*(?:press\s+)?(?:esc|ctrl\+c)\s+(?:to\s+)?(?:interrupt|cancel|stop)\b'] },
+  { line_regex = ['(?i)^\s*[^\n"{}]*[·•]\s*(?:press\s+)?(?:esc|ctrl\+c)\s+(?:to\s+)?(?:interrupt|cancel|stop)\b'] },
+  { line_regex = ['(?i)^\s*esc:cancel\b'] },
+  { line_regex = ['(?i)^\s*msg=interrupt\b'] },
+]
+not = [
+  { line_regex = ['(?i)^\s*(?:press\s+)?(?:enter|↵)\s+(?:to\s+)?(?:confirm|submit|select)\b'] },
+  { line_regex = ['(?i)^\s*(?:esc|tab|↑/?↓).*\b(?:enter\s+(?:to\s+)?(?:confirm|submit|select)|tab\s+(?:to\s+)?amend)\b'] },
+]
